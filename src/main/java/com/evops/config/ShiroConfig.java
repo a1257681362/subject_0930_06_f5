@@ -37,6 +37,8 @@ public class ShiroConfig {
         chain.addPathDefinition("/api/shifts/**", "anon");
         chain.addPathDefinition("/api/workers/**", "anon");
         chain.addPathDefinition("/api/equipment/**", "anon");
+        chain.addPathDefinition("/api/spare-parts/**", "anon");
+        chain.addPathDefinition("/api/part-rules/**", "anon");
         chain.addPathDefinition("/**", "authc");
         return chain;
     }

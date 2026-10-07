@@ -205,3 +205,46 @@ GET    /api/shifts/{id}                         班次详情（分配/确认/延
 ### 验证
 
 - `HighAltitudeSchedulingTest`：窗口补传/补录/重试只形成一条可用结果（`revision` 递增）、候选班次综合过滤（过期资质/类型不匹配/维保装备/窗口过短/条件不适窗均排除）、生成幂等不堆积、确认唯一且幂等、确认时资质过期拦截、窗口收窄与条件恶化自动预警且班次不变、二次确认未通过不能开工、延期保留原计划与通知回执（多次延期原计划不变）、取消确认后可重新生成。
+
+## F5 风电叶片备件库存
+
+在 F1-F4 基础上新增备件库存（schema 版本 `f5-1`）：叶片螺栓、传感器和涂层材料按序列号和批次入库；维修领用绑定风机和缺陷单；替换后记录旧件去向与新件状态；已安装备件不能再次出库；退库须经验收；库存、维修进度和资产档案在同一事务中更新；序列追踪规则调整只生成新版本，不改动旧追踪结论。
+
+### 数据表
+
+| 表 | 说明 |
+| --- | --- |
+| `t_spare_part` | 备件档案：序列号唯一、批次入库；状态 `IN_STOCK/ISSUED/RETURN_PENDING/INSTALLED/RETIRED` |
+| `t_part_inbound` | 入库单：一批一单；记录入库时所用规则版本与追踪结论 |
+| `t_part_requisition` | 维修领用单：绑定风机与缺陷单；状态 `ISSUED/INSTALLED/RETURNED` |
+| `t_part_installation` | 装机台账（资产档案）：归属窗口 `[installed_at, removed_at)`，与叶片台账同一左闭右开口径；拆下时登记旧件去向 |
+| `t_part_replacement` | 换件记录：旧件去向与新件状态的前后关系 |
+| `t_part_return` | 退库单：退库须验收；状态 `PENDING/ACCEPTED/REJECTED` |
+| `t_part_trace_rule` | 序列追踪规则：按备件类型版本化；预置 3 类备件各一个首版本 |
+
+### 业务规则
+
+- **入库**：按序列号和批次入库，序列号全局唯一（批次内也不得重复）；入库单与备件档案同事务落库，并按当前发布的规则版本生成追踪结论。
+- **维修领用**：绑定风机与缺陷单（缺陷单须属于该风机且待维修）；仅在库备件可出库——**已安装（INSTALLED）备件不能再次出库**，已领用/待验收/已退役同样拦截。
+- **换件**：旧件拆下（装机台账窗口闭合、登记去向）与新件装机（状态 `INSTALLED`）同事务完成；存在在装旧件时必须登记旧件去向；换件完成即回填维修结果推进维修进度（缺陷/工单 → `REPAIRED`）；`t_part_replacement` 保留旧件去向与新件状态的前后关系。**库存、维修进度和资产档案在同一事务中更新**，任一校验不过整体不生效。
+- **退库**：仅已领用（未装机）备件可退库；退库须经验收——通过回到在库并闭环领用单，驳回退回已领用；已验收退库单不能重复验收。
+- **规则版本化**：序列追踪规则调整只生成新版本（版本号递增并发布），旧版本退役但内容不改；已产生的入库/装机/换件结论继续引用旧版本，不随规则调整改变。
+
+### 接口一览
+
+```
+POST   /api/spare-parts/inbound                 入库（按序列号和批次，生成追踪结论）
+GET    /api/spare-parts                         库存列表（?partType=&status=）
+GET    /api/spare-parts/{id}                    备件详情
+GET    /api/spare-parts/{id}/trace              序列追踪：入库→领用→装机/退役全生命周期
+POST   /api/spare-parts/requisitions            维修领用（绑定风机与缺陷单）
+POST   /api/spare-parts/requisitions/{id}/replace  换件（旧件去向+新件状态，同事务）
+POST   /api/spare-parts/requisitions/{id}/return   退库申请（进入待验收）
+POST   /api/spare-parts/returns/{id}/accept     退库验收（pass=true 回库 / false 驳回）
+GET    /api/part-rules                          规则全量版本（?partType= 过滤，含已退役）
+POST   /api/part-rules/{partType}/versions      规则调整（只生成新版本）
+```
+
+### 验证
+
+- `SparePartInventoryTest`：序列批次入库与重复序列号拦截、领用绑定风机与缺陷单、非在库拒绝再次出库、换件同事务更新库存/维修进度/资产档案并记录旧件去向与新件状态、缺旧件去向被拦截且三方状态均不变、已安装不能再次出库也不能退库、退库验收通过与驳回、规则调整只生成新版本且旧版本内容与旧结论不改动、序列追踪全生命周期可查。
