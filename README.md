@@ -205,3 +205,57 @@ GET    /api/shifts/{id}                         班次详情（分配/确认/延
 ### 验证
 
 - `HighAltitudeSchedulingTest`：窗口补传/补录/重试只形成一条可用结果（`revision` 递增）、候选班次综合过滤（过期资质/类型不匹配/维保装备/窗口过短/条件不适窗均排除）、生成幂等不堆积、确认唯一且幂等、确认时资质过期拦截、窗口收窄与条件恶化自动预警且班次不变、二次确认未通过不能开工、延期保留原计划与通知回执（多次延期原计划不变）、取消确认后可重新生成。
+
+## F5 风电叶片运维备件库存
+
+在 F1-F4 基础上新增备件库存（schema 版本 `f5-1`）：管理叶片螺栓、传感器与涂层材料；备件按序列号或批次入库；维修领用绑定风机与缺陷单；替换后记录旧件去向与新件状态；已安装备件不能再次出库；退库必须经过验收；库存、维修进度与资产档案在同一事务内更新；规则调整只能生成新版本，历史序列追踪沿用旧版规则、结论不可变。
+
+### 数据表
+
+| 表 | 说明 |
+| --- | --- |
+| `t_spare_part` | 备件定义：类别（螺栓/传感器/涂层）、追踪模式（SERIAL/BATCH）；首次入库后 `tracking_locked` 锁定 |
+| `t_spare_part_rule` | 规则版本：规格、单位、安全库存、保质期；版本号备件内递增，状态 `DRAFT/PUBLISHED/RETIRED` |
+| `t_spare_stock` | 备件实例：序列号件一件一码 / 批次件批次+数量；入库固化规则版本与规格快照；装机风机/叶片/时刻；状态机 |
+| `t_spare_issue` | 维修领用单：必填风机与缺陷单；状态 `RESERVED/ISSUED/COMPLETED/RETURNING/CLOSED` |
+| `t_spare_issue_item` | 领用明细：领用单×备件实例唯一，记录领用数量与替换后新件状态 |
+| `t_spare_replacement` | 替换记录：旧件名称/序列号/去向（待检/再用/报废/返厂）、新件实例与装机状态 |
+| `t_spare_return` | 退库验收：来源（未用退库/旧件回收）、`PENDING → ACCEPTED/REJECTED`、验收人与结论 |
+
+库存状态机：`IN_STOCK → RESERVED → INSTALLED`（装机后不能再次出库）；`RETURN_PENDING → IN_STOCK`（验收合格）/ `SCRAPPED`（不合格）。
+
+### 业务规则
+
+- **序列号/批次入库**：序列号件必须给序列号、一件一码、数量恒 1；批次件必须给批次号与正数数量，同物料序列号/批次唯一。首次入库锁定备件追踪模式。入库时固化当前规则版本号、规格与单位快照（`rule_version_snapshot`/`spec_snapshot`），并按保质期计算到期时刻。
+- **规则版本化（旧结论不可变）**：建档生成并发布规则 V1；调整只能生成 V(n+1)——旧版本置 `RETIRED` 但内容保留不改，备件指向新版本。调整后新入库按新版本快照；**历史备件序列追踪始终沿用其入库时固化的旧版规则与规格，不随新版本改变**（`GET /api/spare-stocks/{id}/trace` 同时返回入库版本与当前版本）。
+- **维修领用绑定风机与缺陷单**：领用单必须绑定风机与缺陷单（缺陷单须属于该风机，已关闭缺陷不能领用）；领用即预占库存（序列号件置 `RESERVED`，批次件扣减余量，余量可被其他领用单继续使用）；已装机/报废/待验收备件不能再次出库。
+- **替换装机（同一事务）**：出库后按明细替换装机，在**同一事务**内更新三处——① 库存：新件 `INSTALLED` 并固化风机/叶片/装机时刻（资产档案）；② 维修进度：缺陷回填维修结果 `OPEN → REPAIRED`、工单联动；③ 替换留痕：旧件去向（`INSPECTION/REUSE/SCRAP/SUPPLIER_R`）与新件状态。任一步失败整体回滚。一张领用单全部明细装机后 `COMPLETED`。
+- **批次口径**：批次件可分次领用，余量在库可再出库；整批出清装机后记录资产位置并锁定。
+- **退库验收**：未用退库（`UNUSED`）与旧件回收（`OLD_PART`，仅旧件去向为待检/修复再用时可发起）均生成 `PENDING` 验收记录，**必须验收**；验收合格回库（序列号件回 `IN_STOCK`、批次件补回余量、合格旧件以原序列号重新入库），不合格报废（序列号件 `SCRAPPED`、批次余量核销）。待验收期间备件不能出库。
+
+### 接口一览
+
+```
+POST   /api/spare-parts                              备件建档（含首版规则 V1 并发布）
+GET    /api/spare-parts                              备件列表
+GET    /api/spare-parts/{id}                         备件详情
+GET    /api/spare-parts/{id}/rules                   全部规则版本（含已退役保留版本）
+POST   /api/spare-parts/{id}/rule-versions           规则调整（生成新版本，旧版本退役保留）
+POST   /api/spare-parts/{partId}/inbound             入库（序列号 serialNo / 批次 batchNo+quantity）
+GET    /api/spare-parts/{partId}/stocks              备件全部库存实例（台账）
+GET    /api/spare-parts/{partId}/available           当前可用库存量
+GET    /api/spare-stocks/{id}                        库存实例详情
+GET    /api/spare-stocks/{id}/trace                  序列/批次追踪（入库版本快照+当前规则+资产档案+替换/退库）
+POST   /api/spare-issues                             维修领用（绑定风机与缺陷单，同时预占库存）
+GET    /api/spare-issues/{id}                        领用单详情（明细+替换+退库验收）
+POST   /api/spare-issues/{id}/issue-out              出库发放
+POST   /api/spare-issues/{id}/replacements           替换装机（同事务更新库存/维修进度/资产档案，记录旧件去向）
+POST   /api/spare-issues/{id}/returns                发起退库（UNUSED/OLD_PART，进入待验收）
+POST   /api/spare-returns/{returnId}/inspect         退库验收（合格回库 / 不合格报废）
+```
+
+联调期上述接口在 Shiro 中放行（`anon`），登录体系接入后收紧。
+
+### 验证
+
+- `SpareInventoryFlowTest`（9 例）：序列号/批次入库与锁定、规则调整只生成新版本且旧序列追踪结论不变、领用绑定风机缺陷（跨风机拒绝）、替换同事务更新库存/维修进度/资产档案与旧件去向、已装机不能再出库与重复装机拒绝、批次分次领用与整批锁定、退库必须验收（合格回库/不合格报废/待验收冻结）、旧件回收去向校验、领用预占与替换装机失败时库存更新整体回滚。
